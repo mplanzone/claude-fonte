@@ -10,7 +10,7 @@ Uso:
   claude-fonte                 mostra a fonte atual
   claude-fonte usar <fonte>    troca (só mexe no settings.json, no timer e no marcador do switcher)
   claude-fonte testar          uma pergunta curta pelo claude, com tempo limite
-  claude-fonte reabrir         reabre as sessões do agent-deck paradas, para pegarem a fonte nova
+  claude-fonte reabrir [grupo…] reabre as sessões vivas do agent-deck paradas (só dos grupos dados, se houver)
   claude-fonte login-switcher  faz o login Google do switcher num servidor sem navegador (sem precisar
                                de nenhum Claude): mostra o link, você loga no navegador do seu computador,
                                ele dá "conexão recusada", você cola aqui o endereço da barra e o comando
@@ -289,14 +289,18 @@ def testar():
     return 0 if ok else 1
 
 
-def reabrir():
-    """Reabre as sessões do agent-deck que estão paradas esperando (as que estão trabalhando ficam: avisa quais)."""
+def reabrir(grupos=()):
+    """Reabre as sessões do agent-deck vivas e paradas esperando (as que estão trabalhando ficam: avisa quais).
+    Sessão em 'error' (processo já morto) nunca é ressuscitada: reabrir todas de uma vez esgotou a memória da
+    máquina. `grupos` limita aos grupos dados."""
     r = rodar(['agent-deck', 'list', '--json'])
     dados = json.loads(r.stdout or '[]')
     sessoes = dados if isinstance(dados, list) else dados.get('sessions', [])
     reabertas, rodando = [], []
     for s in sessoes:
-        if s.get('status') not in ('waiting', 'idle', 'error', 'running'):
+        if s.get('status') not in ('waiting', 'idle', 'running'):
+            continue
+        if grupos and s.get('group') not in grupos:
             continue
         if (s.get('command') or 'claude') != 'claude':
             rodar(['agent-deck', 'session', 'set', s['id'], 'command', 'claude'])
@@ -318,7 +322,7 @@ def main(argv):
     if argv[0] == 'testar':
         return testar()
     if argv[0] == 'reabrir':
-        return reabrir()
+        return reabrir(tuple(argv[1:]))
     if argv[0] in ('login-switcher', 'logar-switcher'):
         return login_switcher()
     print(__doc__)

@@ -154,5 +154,23 @@ class TestLoginSwitcher(Base):
         self.assertIn('claude-fonte login-switcher', self.usar('switcher')[1])
 
 
+
+class TestReabrir(Base):
+    def test_nao_ressuscita_sessao_morta_e_respeita_grupos(self):
+        lista = [{'id': 'a', 'title': 'A', 'status': 'waiting', 'group': 'G1', 'command': 'claude'},
+                 {'id': 'b', 'title': 'B', 'status': 'error', 'group': 'G1', 'command': 'claude'},
+                 {'id': 'c', 'title': 'C', 'status': 'waiting', 'group': 'G2', 'command': 'claude'}]
+        feitos = []
+
+        def falso(cmd, **kw):
+            feitos.append(cmd)
+            return SimpleNamespace(returncode=0, stdout=json.dumps(lista), stderr='')
+        self.m.rodar = falso
+        with redirect_stdout(io.StringIO()):
+            self.m.reabrir(('G1',))
+        reiniciadas = [c[-1] for c in feitos if c[:3] == ['agent-deck', 'session', 'restart']]
+        self.assertEqual(reiniciadas, ['a'])
+
+
 if __name__ == '__main__':
     unittest.main()
