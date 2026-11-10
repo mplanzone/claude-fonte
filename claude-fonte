@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""claude-fonte: escolhe de onde o Claude Code tira o acesso, num comando só.
+
+Fontes:
+  portal    proxy oficial da Seazone (ia.seazone.dev), chave do instalador em ~/.config/seazone-ia
+  login     login normal (/login), sem switcher mexendo nas credenciais
+  switcher  conta do pool do claude-switcher (heartbeat + troca automática no limite)
+
+Uso:
+  claude-fonte                 mostra a fonte atual
+  claude-fonte usar <fonte>    troca (só mexe no settings.json, no timer e no marcador do switcher)
+  claude-fonte testar          uma pergunta curta pelo claude, com tempo limite
+  claude-fonte reabrir         reabre as sessões do agent-deck paradas, para pegarem a fonte nova
+  claude-fonte login-switcher  faz o login Google do switcher num servidor sem navegador (sem precisar
+                               de nenhum Claude): mostra o link, você loga no navegador do seu computador,
+                               ele dá "conexão recusada", você cola aqui o endereço da barra e o comando
+                               entrega o retorno ao servidor
+
+Regras: nunca abre .credentials.json, session.json nem chave; nunca roda
+`switcher login` puro; sair do switcher devolve a conta ao pool (logout) e pede /login logo em seguida,
+porque o token do pool fica no .credentials.json e duas renovações derrubam a conta para a empresa.
+"""
+import json
+import re
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path(os.environ.get('CLAUDE_FONTE_HOME') or Path.home())
+SETTINGS = HOME / '.claude/settings.json'
+ESTADO = HOME / '.local/state/claude-fonte'
+SWITCHER_DIR = HOME / '.claude-switcher'
+NAO_GERENCIE = SWITCHER_DIR / 'nao-me-gerencie'
+TIMER = 'claude-switcher-heartbeat.timer'
+GANCHO = 'bateu-limite'  # hook StopFailure do switcher
+
+
+def CLIENTE_SWITCHER():
+    """Comando `switcher` instalado (link resolvido), usado no gancho de limite; cai para 'switcher' se não achar."""
+    achado = shutil.which('switcher')
+    return os.path.realpath(achado) if achado else 'switcher'
+
+
+VARS_TOKEN = ('ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY')
+
+PROXIES = {
+    'portal': {'helper': HOME / '.config/seazone-ia/chave.sh', 'base': lambda: 'https://ia.seazone.dev',
+               'precisa': HOME / '.config/seazone-ia/chave'},
+}
+FONTES = ('portal', 'login', 'switcher')
+
+
+def rodar(cmd, **kw):
+    """Ponto único de chamada externa (os testes trocam por um falso)."""
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+# ----------------------------------------------------------------------------------------- settings.json
+
+def ler_settings():
+    return json.loads(SETTINGS.read_text(encoding='utf-8')) if SETTINGS.exists() else {}
+
+
+def gravar_settings(d):
+    (ESTADO / 'backup').mkdir(parents=True, exist_ok=True)
+    if SETTINGS.exists():
+        shutil.copy2(SETTINGS, ESTADO / 'backup' / f'settings.json.{datetime.now().strftime("%Y%m%dT%H%M%S.%f")}')
+    tmp = SETTINGS.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps(d, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+    os.replace(tmp, SETTINGS)
+
+
+def _sem_gancho(d):
+    h = d.get('hooks') or {}
+    grupos = [g for g in h.get('StopFailure', []) if not any(GANCHO in x.get('command', '') for x in g.get('hooks', []))]
+    if grupos:
+        h['StopFailure'] = grupos
+    else:
+        h.pop('StopFailure', None)
+    if h:
+        d['hooks'] = h
+    else:
+        d.pop('hooks', None)
+
+
+def settings_para(d, fonte):
+    """Settings novo para a fonte; mexe só em apiKeyHelper, env.ANTHROPIC_* e no gancho do switcher."""
+    d = json.loads(json.dumps(d))
+    env = d.get('env') or {}
+    for v in VARS_TOKEN + ('ANTHROPIC_BASE_URL',):
+        env.pop(v, None)
+    d.pop('apiKeyHelper', None)
+    _sem_gancho(d)
+    if fonte in PROXIES:
+        p = PROXIES[fonte]
+        d['apiKeyHelper'] = str(p['helper'])
+        env['ANTHROPIC_BASE_URL'] = p['base']()
+    if fonte == 'switcher':
+        cmd = f"'{CLIENTE_SWITCHER()}' {GANCHO}"
+        d.setdefault('hooks', {}).setdefault('StopFailure', []).append({'hooks': [{'type': 'command', 'command': cmd}]})
+    if env:
+        d['env'] = env
+    else:
+        d.pop('env', None)
+    return d
+
+
+def fonte_do_settings(d):
+    helper = str(d.get('apiKeyHelper') or '')
+    for nome, p in PROXIES.items():
+        if helper == str(p['helper']):
+            return nome
+    if helper:
+        return 'outro proxy'
+    ganchos = json.dumps((d.get('hooks') or {}).get('StopFailure', []))
+    return 'switcher' if GANCHO in ganchos else 'login'
+
+
+# -------------------------------------------------------------------------------------------- switcher
+
+def timer_ativo():
+    return rodar(['systemctl', '--user', 'is-active', TIMER]).stdout.strip() == 'active'
+
+
+def switcher_tem_sessao():
+    return (SWITCHER_DIR / 'session.json').exists()  # só a existência; o conteúdo nunca é lido
+
+
+def switcher_ativo():
+    return (SWITCHER_DIR / 'active.json').exists()
+
+
+def deixar_switcher_dormente():
+    """Para o heartbeat e marca o switcher como dormente. Devolve a conta do pool se havia uma."""
+    msgs = []
+    if timer_ativo():
+        rodar(['systemctl', '--user', 'disable', '--now', TIMER])
+        msgs.append('heartbeat do switcher desligado')
+    SWITCHER_DIR.mkdir(exist_ok=True)
+    NAO_GERENCIE.touch()
+    if switcher_ativo():  # só com conta do pool em uso; sessão sem conta fica (o logout apagaria o login Google)
+        r = rodar(['switcher', 'logout'])
+        msgs.append('conta do pool devolvida (switcher logout)' if r.returncode == 0
+                    else f'ATENÇÃO: switcher logout falhou: {r.stderr.strip()[:200]}')
+        msgs.append('PRECISA: rode /login agora (o token do pool continua no .credentials.json)')
+    return msgs
+
+
+def ligar_switcher():
+    if not switcher_tem_sessao():
+        return False, ['O switcher está sem login. Rode primeiro:',
+                       '  claude-fonte login-switcher',
+                       'e depois de novo: claude-fonte usar switcher']
+    NAO_GERENCIE.unlink(missing_ok=True)
+    rodar(['systemctl', '--user', 'enable', '--now', TIMER])
+    r = rodar(['switcher', 'switch'])
+    return True, ['heartbeat do switcher ligado',
+                  'conta do pool recebida' if r.returncode == 0 else f'ATENÇÃO: switcher switch falhou: {r.stderr.strip()[:200]}']
+
+
+# ---------------------------------------------------------------------------------------------- comandos
+
+def status():
+    d = ler_settings()
+    f = fonte_do_settings(d)
+    base = (d.get('env') or {}).get('ANTHROPIC_BASE_URL', '-')
+    print(f'Fonte atual: {f}' + (f' ({base})' if f in PROXIES else ''))
+    print(f'Switcher: heartbeat {"ligado" if timer_ativo() else "desligado"}; '
+          f'{"com conta do pool" if switcher_ativo() else "sem conta do pool"}; '
+          f'{"dormente" if NAO_GERENCIE.exists() else "gerenciando"}')
+    print(f'Login do switcher: {"ok" if switcher_tem_sessao() else "FALTA (claude-fonte login-switcher)"}')
+    for nome, p in PROXIES.items():
+        print(f'Chave do {nome}: {"ok" if p["precisa"].exists() else "FALTA"}')
+    return 0
+
+
+# ------------------------------------------------------------------- login do switcher num servidor sem navegador
+
+def porta_do_link(link):
+    """Porta do retorno (redirect_uri=http://127.0.0.1:<porta>/callback) no link do Google, ou None."""
+    m = re.search(r'redirect_uri=http(?:%3A|:)(?:%2F%2F|//)127\.0\.0\.1(?:%3A|:)(\d+)', link)
+    return int(m.group(1)) if m else None
+
+
+def retorno_valido(colado, porta):
+    """O endereço que o navegador mostrou na falha, se for o retorno desta tentativa; senão None."""
+    colado = colado.strip().strip('"\'<>')
+    ok = re.match(rf'^http://(?:127\.0\.0\.1|localhost):{porta}/callback\?\S*\bcode=', colado)
+    return colado.replace('localhost', '127.0.0.1', 1) if ok else None
+
+
+def login_switcher():
+    import urllib.request
+    SWITCHER_DIR.mkdir(exist_ok=True)
+    NAO_GERENCIE.touch()  # regra: o login nunca pode puxar conta do pool sozinho
+    env = {**os.environ, 'PYTHONUNBUFFERED': '1', 'BROWSER': 'true'}  # BROWSER=true: não tenta abrir navegador
+    p = subprocess.Popen(['switcher', 'login', '--somente-login'], stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True, env=env)
+    link, fim = None, time.time() + 30
+    while time.time() < fim and link is None:
+        linha = p.stdout.readline()
+        if not linha:
+            break
+        m = re.search(r'https://accounts\.google\.com/\S+', linha)
+        link = m.group(0) if m else None
+    porta = porta_do_link(link or '')
+    if not porta:
+        p.kill()
+        print('Não consegui o link do Google. Rode de novo; se repetir: switcher doctor')
+        return 1
+    print('\n1. Abra este link no navegador do seu computador e entre com a conta Seazone:\n')
+    print(link)
+    print('\n2. No fim vai aparecer "conexão recusada" (é normal: o retorno é para este servidor).')
+    print('3. Copie o endereço inteiro da barra do navegador (começa com http://127.0.0.1:'
+          f'{porta}/callback) e cole aqui.\n')
+    while True:
+        try:
+            colado = input('Endereço: ')
+        except (EOFError, KeyboardInterrupt):
+            p.kill()
+            print('\nCancelado. Nada mudou.')
+            return 1
+        url = retorno_valido(colado, porta)
+        if url:
+            break
+        print(f'Esse não é o endereço de retorno desta tentativa (precisa começar com http://127.0.0.1:{porta}/callback e ter code=). Tente de novo.')
+    try:
+        urllib.request.urlopen(url, timeout=30).read()
+    except Exception as e:  # o switcher pode fechar a conexão logo depois de ler o code
+        if p.poll() is None:
+            print(f'Falha ao entregar o retorno: {e}')
+    try:
+        saida, _ = p.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        saida = ''
+    ok = switcher_tem_sessao()
+    print('\n' + ('Login do switcher OK.' if ok else 'O login não foi concluído.'))
+    for linha in (saida or '').splitlines():
+        if 'login' in linha.lower() and 'token' not in linha.lower():
+            print('  ' + linha.strip())
+    if ok:
+        print('Ele fica dormente. Para usar: claude-fonte usar switcher')
+    return 0 if ok else 1
+
+
+def usar(fonte):
+    if fonte not in FONTES:
+        print(f'Fonte desconhecida: {fonte}. Opções: {", ".join(FONTES)}')
+        return 2
+    if fonte in PROXIES and not PROXIES[fonte]['precisa'].exists():
+        dica = 'rode o instalador do portal (curl -fsSL https://ia.seazone.dev/install.sh | sh)'
+        print(f'Sem chave para {fonte}: {dica}')
+        return 1
+    msgs = []
+    if fonte == 'switcher':
+        ok, m = ligar_switcher()
+        msgs += m
+        if not ok:
+            print('\n'.join(msgs))
+            return 1
+    else:
+        msgs += deixar_switcher_dormente()
+    gravar_settings(settings_para(ler_settings(), fonte))
+    (ESTADO).mkdir(parents=True, exist_ok=True)
+    (ESTADO / 'atual').write_text(fonte + '\n')
+    msgs.append(f'settings.json agora usa: {fonte} (backup em {ESTADO / "backup"})')
+    if fonte == 'login':
+        msgs.append('Se ainda não fez, rode /login numa sessão (a conta que ficar no login vale para todas).')
+    msgs.append('Sessões já abertas continuam na fonte antiga até reabrir: claude-fonte reabrir')
+    print('\n'.join(msgs))
+    return 0
+
+
+def testar():
+    ini = time.time()
+    try:
+        r = rodar(['claude', '-p', 'responda só: OK'], cwd='/tmp', timeout=90, stdin=subprocess.DEVNULL)
+        saida = (r.stdout.strip().splitlines() or [''])[-1]
+        ok = 'OK' in saida and r.returncode == 0
+    except subprocess.TimeoutExpired:
+        ok, saida = False, 'sem resposta em 90 s'
+    print(f'{"OK" if ok else "FALHOU"} em {time.time() - ini:.0f} s pela fonte {fonte_do_settings(ler_settings())}'
+          + ('' if ok else f': {saida[:200]}'))
+    return 0 if ok else 1
+
+
+def reabrir():
+    """Reabre as sessões do agent-deck que estão paradas esperando (as que estão trabalhando ficam: avisa quais)."""
+    r = rodar(['agent-deck', 'list', '--json'])
+    dados = json.loads(r.stdout or '[]')
+    sessoes = dados if isinstance(dados, list) else dados.get('sessions', [])
+    reabertas, rodando = [], []
+    for s in sessoes:
+        if s.get('status') not in ('waiting', 'idle', 'error', 'running'):
+            continue
+        if (s.get('command') or 'claude') != 'claude':
+            rodar(['agent-deck', 'session', 'set', s['id'], 'command', 'claude'])
+        if s.get('status') == 'running':
+            rodando.append(s['title'])
+            continue
+        if rodar(['agent-deck', 'session', 'restart', '--force', s['id']]).returncode == 0:
+            reabertas.append(s['title'])
+    print(f'Reabertas ({len(reabertas)}): ' + (', '.join(reabertas) or '-'))
+    print(f'Trabalhando agora, reabrir depois ({len(rodando)}): ' + (', '.join(rodando) or '-'))
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ('status', 'qual'):
+        return status()
+    if argv[0] == 'usar' and len(argv) == 2:
+        return usar(argv[1])
+    if argv[0] == 'testar':
+        return testar()
+    if argv[0] == 'reabrir':
+        return reabrir()
+    if argv[0] in ('login-switcher', 'logar-switcher'):
+        return login_switcher()
+    print(__doc__)
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
