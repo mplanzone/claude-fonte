@@ -33,12 +33,14 @@ class Base(unittest.TestCase):
         self.settings.write_text(json.dumps({'model': 'opus', 'env': {'OUTRA': '1'},
                                              'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': 'x'}]}]}}))
         self.m = carregar(self.home)
-        self.chamadas, self.timer = [], 'inactive'
+        self.chamadas, self.timer, self.subestado = [], 'inactive', 'waiting'
 
         def falso(cmd, **kw):
             self.chamadas.append(cmd)
             if cmd[:3] == ['systemctl', '--user', 'is-active']:
                 return SimpleNamespace(returncode=0, stdout=self.timer + '\n', stderr='')
+            if cmd[:3] == ['systemctl', '--user', 'show']:
+                return SimpleNamespace(returncode=0, stdout=self.subestado + '\n', stderr='')
             return SimpleNamespace(returncode=0, stdout='[]', stderr='')
         self.m.rodar = falso
 
@@ -114,6 +116,14 @@ class TestUsar(Base):
         self.usar('switcher')  # de novo: um gancho só
         self.assertEqual(len(self.lido()['hooks']['StopFailure']), 1)
 
+    def test_ligar_switcher_dispara_o_heartbeat_depois_de_pegar_a_conta(self):
+        # O timer só se rearma depois que o serviço roda uma vez (OnUnitActiveSec); sem isso fica "elapsed".
+        sw = self.home / '.claude-switcher'; sw.mkdir(); (sw / 'session.json').write_text('{}')
+        self.usar('switcher')
+        disparo = ['systemctl', '--user', 'start', '--no-block', self.m.SERVICO]
+        self.assertIn(disparo, self.chamadas)
+        self.assertGreater(self.chamadas.index(disparo), self.chamadas.index(['switcher', 'switch']))
+
     def test_proxy_sem_chave_recusa(self):
         (self.home / '.config/seazone-ia/chave').unlink()
         antes = self.settings.read_text()
@@ -152,6 +162,22 @@ class TestLoginSwitcher(Base):
 
     def test_usar_switcher_sem_login_aponta_o_comando(self):
         self.assertIn('claude-fonte login-switcher', self.usar('switcher')[1])
+
+    def status_texto(self):
+        with redirect_stdout(io.StringIO()) as out:
+            self.m.status()
+        return out.getvalue()
+
+    def test_status_timer_sem_proximo_disparo_nao_aparece_como_ligado(self):
+        self.timer, self.subestado = 'active', 'elapsed'  # caso real de 09/11: ativo, mas sem disparo marcado
+        out = self.status_texto()
+        self.assertIn('PARADO', out)
+        self.assertNotIn('heartbeat ligado', out)
+        self.assertIn(self.m.SERVICO, out)  # diz como destravar
+
+    def test_status_timer_armado_aparece_como_ligado(self):
+        self.timer, self.subestado = 'active', 'waiting'
+        self.assertIn('heartbeat ligado', self.status_texto())
 
 
 

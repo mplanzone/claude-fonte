@@ -36,6 +36,7 @@ ESTADO = HOME / '.local/state/claude-fonte'
 SWITCHER_DIR = HOME / '.claude-switcher'
 NAO_GERENCIE = SWITCHER_DIR / 'nao-me-gerencie'
 TIMER = 'claude-switcher-heartbeat.timer'
+SERVICO = 'claude-switcher-heartbeat.service'
 GANCHO = 'bateu-limite'  # hook StopFailure do switcher
 
 
@@ -126,6 +127,12 @@ def timer_ativo():
     return rodar(['systemctl', '--user', 'is-active', TIMER]).stdout.strip() == 'active'
 
 
+def timer_armado():
+    """Ativo E com próximo disparo. O timer usa OnUnitActiveSec: ligado sem o serviço rodar fica 'elapsed' para sempre."""
+    sub = rodar(['systemctl', '--user', 'show', TIMER, '--property=SubState', '--value']).stdout.strip()
+    return timer_ativo() and sub != 'elapsed'
+
+
 def switcher_tem_sessao():
     return (SWITCHER_DIR / 'session.json').exists()  # só a existência; o conteúdo nunca é lido
 
@@ -158,6 +165,7 @@ def ligar_switcher():
     NAO_GERENCIE.unlink(missing_ok=True)
     rodar(['systemctl', '--user', 'enable', '--now', TIMER])
     r = rodar(['switcher', 'switch'])
+    rodar(['systemctl', '--user', 'start', '--no-block', SERVICO])  # 1º heartbeat: é ele que arma os próximos
     return True, ['heartbeat do switcher ligado',
                   'conta do pool recebida' if r.returncode == 0 else f'ATENÇÃO: switcher switch falhou: {r.stderr.strip()[:200]}']
 
@@ -169,7 +177,13 @@ def status():
     f = fonte_do_settings(d)
     base = (d.get('env') or {}).get('ANTHROPIC_BASE_URL', '-')
     print(f'Fonte atual: {f}' + (f' ({base})' if f in PROXIES else ''))
-    print(f'Switcher: heartbeat {"ligado" if timer_ativo() else "desligado"}; '
+    if timer_armado():
+        heartbeat = 'heartbeat ligado'
+    elif timer_ativo():
+        heartbeat = f'heartbeat PARADO (ligado sem próximo disparo; rode: systemctl --user start {SERVICO})'
+    else:
+        heartbeat = 'heartbeat desligado'
+    print(f'Switcher: {heartbeat}; '
           f'{"com conta do pool" if switcher_ativo() else "sem conta do pool"}; '
           f'{"dormente" if NAO_GERENCIE.exists() else "gerenciando"}')
     print(f'Login do switcher: {"ok" if switcher_tem_sessao() else "FALTA (claude-fonte login-switcher)"}')
